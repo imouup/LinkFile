@@ -134,7 +134,11 @@ def upload(
     if method.get("type") == "cloudreve" and expire:
         console.print("Cloudreve direct links do not support expiration; --expire will be ignored.")
         typer.confirm("Continue?", abort=True)
-    result = create_strategy(method).upload_file(file, expire=expire)
+    try:
+        result = create_strategy(method).upload_file(file, expire=expire)
+    except RuntimeError as exc:
+        console.print(f"[red]Upload failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
     LocalIndex().add_upload_result(result)
     _print_upload_result(result, output_format)
 
@@ -196,7 +200,11 @@ def download(
     """Download a file by LinkFile id."""
     record = LocalIndex().get_file(file_id)
     method = find_storage_method(load_config(), record.storage_method_id)
-    target = create_strategy(method).download_file(record, destination)
+    try:
+        target = create_strategy(method).download_file(record, destination)
+    except RuntimeError as exc:
+        console.print(f"[red]Download failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
     console.print(f"Downloaded: {target}")
 
 
@@ -212,7 +220,11 @@ def delete(
         typer.confirm(f"Delete {record.name}?", abort=True)
     if not local_only:
         method = find_storage_method(load_config(), record.storage_method_id)
-        create_strategy(method).delete_file(record)
+        try:
+            create_strategy(method).delete_file(record)
+        except RuntimeError as exc:
+            console.print(f"[red]Delete failed:[/red] {exc}")
+            raise typer.Exit(1) from exc
     LocalIndex().delete_file(file_id)
     console.print(f"Deleted: {file_id}")
 
@@ -305,6 +317,7 @@ def _print_upload_result(result: UploadResult, output_format: str) -> None:
         return
     if output_format != "text":
         raise typer.BadParameter("--format currently supports: text, json")
+    console.print(f"ID: {result.file_id}")
     console.print(f"File: {result.name}")
     if result.share_url:
         console.print("Share:")

@@ -5,6 +5,7 @@ import types
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 from linkfile_core.index import FileRecord
 from storage.cloudreve import CloudreveStrategy
 from storage.s3 import S3Strategy
@@ -127,36 +128,60 @@ def test_cloudreve_strategy_upload_uses_source_url(monkeypatch) -> None:
     source.write_text("hello", encoding="utf-8")
     calls: list[tuple[str, str]] = []
 
-    class FakeCloudreveV4:
-        def __init__(self, base_url: str) -> None:
-            self.base_url = base_url
+    def response(method: str, path: str, payload: dict | list | None) -> httpx.Response:
+        if payload is None:
+            return httpx.Response(204, request=httpx.Request(method, path))
+        return httpx.Response(
+            200,
+            json={"code": 0, "msg": "ok", "data": payload},
+            request=httpx.Request(method, path),
+        )
 
-        def login(self, username: str, password: str) -> None:
-            calls.append(("login", username))
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
 
-        def list(self, path: str):
-            calls.append(("list", path))
-            return []
+        def __enter__(self):
+            return self
 
-        def upload(self, local_path: str, remote_path: str) -> None:
-            calls.append(("upload", remote_path))
+        def __exit__(self, exc_type, exc, tb):
+            return None
 
-        def get_source_url(self, uri: str):
-            calls.append(("get_source_url", uri))
-            return "https://cloud.example.com/d/report"
+        def post(self, path, **kwargs):
+            calls.append(("POST", path))
+            if path == "/session/token":
+                return response(
+                    "POST",
+                    path,
+                    {"token": {"access_token": "access", "refresh_token": "refresh"}},
+                )
+            return self.request("POST", path, **kwargs)
 
-    class FakeCloudreveV3:
-        def __init__(self, base_url: str) -> None:
-            self.base_url = base_url
+        def request(self, method, path, **kwargs):
+            calls.append((method, path))
+            if method == "GET" and path == "/file":
+                return response(
+                    "GET",
+                    path,
+                    {"storage_policy": {"id": "policy", "type": "local"}},
+                )
+            if method == "PUT" and path == "/file/upload":
+                return response(
+                    "PUT",
+                    path,
+                    {"session_id": "session", "chunk_size": 1024},
+                )
+            if method == "POST" and path == "/file/upload/session/0":
+                return response("POST", path, None)
+            if method == "PUT" and path == "/file/source":
+                return response(
+                    "PUT",
+                    path,
+                    [{"link": "https://cloud.example.com/d/report"}],
+                )
+            return httpx.Response(404, request=httpx.Request(method, path))
 
-        def login(self, username: str, password: str) -> None:
-            raise RuntimeError("v3 should not be used in this test")
-
-    monkeypatch.setitem(
-        sys.modules,
-        "cloudreve",
-        types.SimpleNamespace(Cloudreve=FakeCloudreveV3, CloudreveV4=FakeCloudreveV4),
-    )
+    monkeypatch.setattr(httpx, "Client", FakeClient)
 
     strategy = CloudreveStrategy(
         {
@@ -167,7 +192,6 @@ def test_cloudreve_strategy_upload_uses_source_url(monkeypatch) -> None:
             "password": "pass",
             "root_path": "/LinkFile",
             "prefer_direct_url": True,
-            "api_version": "v4",
         }
     )
 
@@ -176,14 +200,138 @@ def test_cloudreve_strategy_upload_uses_source_url(monkeypatch) -> None:
 
         assert result.share_url is None
         assert result.raw_url == "https://cloud.example.com/d/report"
-        assert ("login", "user") in calls
-        assert ("upload", "/LinkFile/report.txt") in calls
+        assert ("POST", "/session/token") in calls
+        assert ("PUT", "/file/upload") in calls
+        assert ("POST", "/file/upload/session/0") in calls
+        assert ("PUT", "/file/source") in calls
     finally:
         source.unlink(missing_ok=True)
         work_dir.rmdir()
 
 
-def test_cloudreve_generate_temporary_url_uses_direct_link() -> None:
+def test_cloudreve_download_url_normalization() -> None:
+    strategy = CloudreveStrategy(
+        {
+            "id": "my-cloud",
+            "type": "cloudreve",
+            "base_url": "https://cloud.example.com",
+            "username": "user",
+            "password": "pass",
+            "root_path": "/LinkFile",
+            "prefer_direct_url": True,
+        }
+    )
+
+    assert strategy._absolute_url("https://cdn.example.com/file") == "https://cdn.example.com/file"
+    assert strategy._absolute_url("/api/v4/file/download/x") == (
+        "https://cloud.example.com/api/v4/file/download/x"
+    )
+    assert strategy._absolute_url("file/download/x") == (
+        "https://cloud.example.com/api/v4/file/download/x"
+    )
+
+
+def test_cloudreve_retries_transient_network_errors() -> None:
+    strategy = CloudreveStrategy(
+        {
+            "id": "my-cloud",
+            "type": "cloudreve",
+            "base_url": "https://cloud.example.com",
+            "username": "user",
+            "password": "pass",
+            "root_path": "/LinkFile",
+            "prefer_direct_url": True,
+            "network_retries": 2,
+            "network_retry_backoff": 0,
+        }
+    )
+    attempts = 0
+
+    def flaky_send() -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("temporary EOF")
+        return httpx.Response(200, request=httpx.Request("GET", "https://cloud.example.com"))
+
+    response = strategy._send_with_retries(flaky_send, "test request")
+
+    assert response.status_code == 200
+    assert attempts == 2
+
+
+def test_cloudreve_delete_uses_v4_file_payload(monkeypatch) -> None:
+    captured: dict | None = None
+
+    def response(method: str, path: str, payload: dict) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"code": 0, "msg": "ok", "data": payload},
+            request=httpx.Request(method, path),
+        )
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def post(self, path, **kwargs):
+            return response(
+                "POST",
+                path,
+                {"token": {"access_token": "access", "refresh_token": "refresh"}},
+            )
+
+        def request(self, method, path, **kwargs):
+            nonlocal captured
+            if method == "DELETE" and path == "/file":
+                captured = kwargs["json"]
+                return response("DELETE", path, {})
+            return httpx.Response(404, request=httpx.Request(method, path))
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    strategy = CloudreveStrategy(
+        {
+            "id": "my-cloud",
+            "type": "cloudreve",
+            "base_url": "https://cloud.example.com",
+            "username": "user",
+            "password": "pass",
+            "root_path": "/LinkFile",
+            "prefer_direct_url": True,
+        }
+    )
+    record = FileRecord(
+        file_id="file_1",
+        name="report.txt",
+        size=5,
+        storage_method_id="my-cloud",
+        storage_type="cloudreve",
+        storage_key="cloudreve://my/LinkFile/report.txt",
+        mime_type="text/plain",
+        public_url=None,
+        share_url=None,
+        expires_at=None,
+        created_at="now",
+        updated_at="now",
+        metadata={},
+    )
+
+    strategy.delete_file(record)
+
+    assert captured == {
+        "uris": ["cloudreve://my/LinkFile/report.txt"],
+        "unlink": False,
+        "trash_bin": False,
+    }
+
+
+def test_cloudreve_returns_existing_share_for_non_direct_links() -> None:
     strategy = CloudreveStrategy(
         {
             "id": "my-cloud",
@@ -193,16 +341,8 @@ def test_cloudreve_generate_temporary_url_uses_direct_link() -> None:
             "password": "pass",
             "root_path": "/LinkFile",
             "prefer_direct_url": False,
-            "api_version": "v4",
         }
     )
-
-    class FakeCloudreveClient:
-        def get_source_url(self, uri: str):
-            return "https://cloud.example.com/d/report"
-
-    strategy._client = FakeCloudreveClient()
-    strategy._api_version = "v4"
     record = FileRecord(
         file_id="file_1",
         name="report.txt",
@@ -219,4 +359,4 @@ def test_cloudreve_generate_temporary_url_uses_direct_link() -> None:
         metadata={},
     )
 
-    assert strategy.generate_temporary_url(record) == "https://cloud.example.com/d/report"
+    assert strategy.generate_temporary_url(record) == "https://cloud.example.com/s/report"

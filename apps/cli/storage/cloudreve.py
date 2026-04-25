@@ -1,40 +1,59 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from pathlib import Path
+from time import sleep
+from urllib.parse import urljoin, urlparse
 
+import httpx
 from linkfile_core.index import FileRecord
 from linkfile_core.models import ShareDeliveryMode, StorageType, UploadResult
-from linkfile_core.utils import expires_at_from_duration, guess_mime_type, sha256_file
+from linkfile_core.utils import (
+    duration_seconds,
+    expires_at_from_duration,
+    guess_mime_type,
+    sha256_file,
+)
+
+_NETWORK_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.NetworkError,
+    httpx.PoolTimeout,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+)
 
 
 class CloudreveStrategy:
-    """Cloudreve storage backend using the cloudreve SDK (v3/v4)."""
-
     def __init__(self, config: dict) -> None:
         self.config = config
-        self._client: object | None = None
-        self._api_version: str | None = None
+        self.site_url = config["base_url"].rstrip("/")
+        self.base_url = self._api_base_url(config["base_url"])
+        self._access_token: str | None = config.get("access_token") or config.get("token")
+        self._refresh_token: str | None = config.get("refresh_token")
 
     def test_connection(self) -> None:
-        client, _ = self._client_instance()
-        root_path = (self.config.get("root_path") or "/").rstrip("/") or "/"
-        if hasattr(client, "list"):
-            try:
-                client.list(root_path)
-            except Exception as exc:
-                if root_path != "/" and self._is_missing_path_error(exc):
-                    # Create the root folder on first run so uploads can proceed.
-                    self._ensure_remote_folder(client, root_path)
-                    client.list(root_path)
-                else:
-                    raise
+        self._request(
+            "GET",
+            "/file",
+            params={
+                "uri": self._cloudreve_uri(self.config.get("root_path") or "/"),
+                "page": 0,
+                "page_size": 1,
+            },
+        )
 
     def upload_file(self, path: Path, *, expire: str | None = None) -> UploadResult:
-        client, api_version = self._client_instance()
-        remote_path = self._remote_path(path)
-        storage_key = self._upload(client, api_version, path, remote_path)
-        link = self._create_link(client, storage_key)
+        storage_key = self._remote_file_uri(path)
+        upload_session = self._create_upload_session(path, storage_key)
+        self._upload_content(path, upload_session)
+        link = self._create_link(storage_key, expire=expire)
+        prefer_direct_url = bool(self.config.get("prefer_direct_url"))
         return UploadResult(
             file_id=f"file_{uuid.uuid4().hex}",
             name=path.name,
@@ -43,49 +62,47 @@ class CloudreveStrategy:
             storage_method_id=self.config["id"],
             storage_type=StorageType.CLOUDREVE,
             storage_key=storage_key,
-            share_url=None,
-            raw_url=link,
+            share_url=None if prefer_direct_url else link,
+            raw_url=link if prefer_direct_url else None,
             expires_at=expires_at_from_duration(expire),
             metadata={
                 "sha256": sha256_file(path),
-                "delivery_mode": ShareDeliveryMode.CLOUDREVE_DIRECT_URL,
-                "cloudreve_api_version": api_version,
+                "delivery_mode": (
+                    ShareDeliveryMode.CLOUDREVE_DIRECT_URL
+                    if prefer_direct_url
+                    else ShareDeliveryMode.CLOUDREVE_SHARE_URL
+                ),
             },
         )
 
     def download_file(self, record: FileRecord, destination: Path) -> Path:
-        client, api_version = self._client_instance()
         target = (
             destination / record.name
             if destination.exists() and destination.is_dir()
             else destination
         )
         target.parent.mkdir(parents=True, exist_ok=True)
-        if api_version == "v4":
-            # Legacy v3 uploads store an ID, so fall back to the v3 client for those.
-            if not self._is_v4_uri(record.storage_key):
-                legacy_client, _ = self._login_v3()
-                legacy_client.download(record.storage_key, str(target))
-                return target
-            uri = self._normalize_v4_uri(record.storage_key)
-            url = self._download_url(client, uri)
-            if not url:
-                raise RuntimeError("Cloudreve did not return a download URL.")
-            self._download_from_url(url, target)
-        else:
-            client.download(record.storage_key, str(target))
+        download_url = self._download_url(record.storage_key)
+        headers = self._auth_headers()
+        with httpx.Client(timeout=60) as client:
+            response = self._send_with_retries(
+                lambda: client.get(download_url, headers=headers),
+                "download file content",
+            )
+        response.raise_for_status()
+        target.write_bytes(response.content)
         return target
 
     def delete_file(self, record: FileRecord) -> None:
-        client, api_version = self._client_instance()
-        if api_version == "v4":
-            if not self._is_v4_uri(record.storage_key):
-                legacy_client, _ = self._login_v3()
-                legacy_client.delete(record.storage_key, is_dir=False)
-                return
-            client.delete(self._normalize_v4_uri(record.storage_key))
-        else:
-            client.delete(record.storage_key, is_dir=False)
+        self._request(
+            "DELETE",
+            "/file",
+            json={
+                "uris": [self._cloudreve_uri(record.storage_key)],
+                "unlink": False,
+                "trash_bin": False,
+            },
+        )
 
     def generate_temporary_url(
         self,
@@ -93,141 +110,313 @@ class CloudreveStrategy:
         *,
         expire: str | None = None,
     ) -> str | None:
-        client, api_version = self._client_instance()
-        if api_version == "v4" and not self._is_v4_uri(record.storage_key):
-            legacy_client, _ = self._login_v3()
-            return self._create_link(legacy_client, record.storage_key)
-        uri = (
-            self._normalize_v4_uri(record.storage_key)
-            if api_version == "v4"
-            else record.storage_key
+        if record.share_url and not self.config.get("prefer_direct_url"):
+            return record.share_url
+        return self._create_link(record.storage_key, expire=expire)
+
+    def _create_upload_session(self, path: Path, storage_key: str) -> dict:
+        parent_uri = storage_key.rsplit("/", 1)[0] or "/"
+        directory = self._request(
+            "GET",
+            "/file",
+            params={
+                "uri": self._cloudreve_uri(parent_uri),
+                "page": 0,
+                "page_size": 1,
+                "order_by": "name",
+                "order": "asc",
+            },
         )
-        return self._create_link(client, uri)
+        policy = directory.get("storage_policy") or {}
+        policy_id = policy.get("id")
+        if policy_id is None:
+            raise RuntimeError("Cloudreve directory response did not include a storage policy.")
 
-    def _client_instance(self) -> tuple[object, str]:
-        if self._client and self._api_version:
-            return self._client, self._api_version
-        api_version = str(self.config.get("api_version") or "auto").lower()
-        if api_version in {"v4", "4"}:
-            return self._login_v4()
-        if api_version in {"v3", "3"}:
-            return self._login_v3()
-        try:
-            return self._login_v4()
-        except Exception as exc_v4:
-            try:
-                return self._login_v3()
-            except Exception as exc_v3:
-                raise RuntimeError(
-                    f"Cloudreve login failed for both v4 and v3 clients. Last v4 error: {exc_v4}"
-                ) from exc_v3
+        upload_session = self._request(
+            "PUT",
+            "/file/upload",
+            json={
+                "uri": self._cloudreve_uri(storage_key),
+                "size": path.stat().st_size,
+                "last_modified": int(path.stat().st_mtime * 1000),
+                "policy_id": policy_id,
+                "mime_type": guess_mime_type(path),
+            },
+        )
+        if not isinstance(upload_session, dict):
+            raise RuntimeError("Cloudreve upload session response was not an object.")
+        upload_session.setdefault("policy_type", policy.get("type"))
+        return upload_session
 
-    def _login_v4(self) -> tuple[object, str]:
-        CloudreveV4 = self._cloudreve_class("CloudreveV4")
-        client = CloudreveV4(self.config["base_url"])
-        client.login(self.config["username"], self.config["password"])
-        self._client = client
-        self._api_version = "v4"
-        return client, "v4"
+    def _upload_content(self, path: Path, session: dict) -> None:
+        policy_type = str(session.get("policy_type") or session.get("policyType") or "").lower()
+        upload_urls = session.get("upload_urls") or session.get("uploadURLs") or []
+        if upload_urls and policy_type == "remote":
+            self._upload_remote_direct(path, session)
+            return
+        if policy_type in {"", "local", "remote"}:
+            self._upload_via_cloudreve(path, session)
+            return
+        if policy_type == "onedrive":
+            self._upload_to_onedrive(path, session)
+            return
+        raise RuntimeError(f"Unsupported Cloudreve storage policy: {policy_type}")
 
-    def _login_v3(self) -> tuple[object, str]:
-        Cloudreve = self._cloudreve_class("Cloudreve")
-        client = Cloudreve(self.config["base_url"])
-        client.login(self.config["username"], self.config["password"])
-        self._client = client
-        self._api_version = "v3"
-        return client, "v3"
-
-    def _cloudreve_class(self, name: str):
-        try:
-            import cloudreve
-        except ImportError as exc:
-            raise RuntimeError(
-                "Cloudreve support requires the cloudreve package. Install it with: pip install cloudreve"
-            ) from exc
-        return getattr(cloudreve, name)
-
-    def _upload(
-        self,
-        client: object,
-        api_version: str,
-        path: Path,
-        remote_path: str,
-    ) -> str:
-        if api_version == "v4":
-            client.upload(str(path), remote_path)
-            return remote_path
-        client.upload(remote_path, str(path))
-        return client.get_id(remote_path)
-
-    def _create_link(
-        self,
-        client: object,
-        storage_key: str,
-        *,
-        expire: str | None = None,
-    ) -> str | None:
-        # Direct links are returned; expire is ignored by design.
-        _ = expire
-        return self._extract_link(client.get_source_url(storage_key))
-
-    def _download_url(self, client: object, storage_key: str) -> str | None:
-        if hasattr(client, "get_download_url"):
-            return self._extract_link(client.get_download_url(storage_key))
-        if hasattr(client, "get_source_url"):
-            return self._extract_link(client.get_source_url(storage_key))
-        return None
-
-    def _download_from_url(self, url: str, target: Path) -> None:
-        try:
-            import requests
-        except ImportError as exc:
-            raise RuntimeError("requests is required to download Cloudreve files.") from exc
-        with requests.get(url, stream=True, timeout=60) as response:
-            response.raise_for_status()
-            with target.open("wb") as file_obj:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        file_obj.write(chunk)
-
-    def _ensure_remote_folder(self, client: object, root_path: str) -> None:
-        if hasattr(client, "create_folder"):
-            client.create_folder(root_path)
-        elif hasattr(client, "create_dir"):
-            client.create_dir(root_path)
-        else:
-            raise RuntimeError("Cloudreve client does not support folder creation.")
-
-    def _is_missing_path_error(self, exc: Exception) -> bool:
-        message = str(exc).lower()
-        return "path not exist" in message or "40016" in message
-
-    def _is_v4_uri(self, storage_key: str) -> bool:
-        return storage_key.startswith("cloudreve://") or storage_key.startswith("/")
-
-    def _normalize_v4_uri(self, storage_key: str) -> str:
-        # v4 expects cloudreve://my/... URIs.
-        if storage_key.startswith("cloudreve://"):
-            return storage_key.rstrip("/")
-        if not storage_key.startswith("/"):
-            storage_key = f"/{storage_key}"
-        uri = f"cloudreve://my{storage_key}"
-        return uri.rstrip("/")
-
-    def _extract_link(self, value: object) -> str | None:
-        if isinstance(value, str):
-            return value
-        if isinstance(value, dict):
-            return (
-                value.get("url")
-                or value.get("link")
-                or value.get("share_url")
-                or value.get("download_url")
+    def _upload_via_cloudreve(self, path: Path, session: dict) -> None:
+        session_id = self._session_value(session, "session_id", "sessionID")
+        chunk_size = int(
+            self._session_value(
+                session,
+                "chunk_size",
+                "chunkSize",
+                default=4 * 1024 * 1024,
             )
-        if isinstance(value, list) and value:
-            return self._extract_link(value[0])
+        )
+        with path.open("rb") as file_obj:
+            block_id = 0
+            while True:
+                chunk = file_obj.read(chunk_size)
+                if not chunk:
+                    break
+                self._request(
+                    "POST",
+                    f"/file/upload/{session_id}/{block_id}",
+                    headers={
+                        "Content-Length": str(len(chunk)),
+                        "Content-Type": "application/octet-stream",
+                    },
+                    content=chunk,
+                )
+                block_id += 1
+
+    def _upload_remote_direct(self, path: Path, session: dict) -> None:
+        upload_urls = session.get("upload_urls") or session.get("uploadURLs") or []
+        upload_url = upload_urls[0]
+        credential = session.get("credential") or ""
+        chunk_size = int(
+            self._session_value(
+                session,
+                "chunk_size",
+                "chunkSize",
+                default=4 * 1024 * 1024,
+            )
+        )
+        with httpx.Client(timeout=60) as client, path.open("rb") as file_obj:
+            block_id = 0
+            while True:
+                chunk = file_obj.read(chunk_size)
+                if not chunk:
+                    break
+                response = self._send_with_retries(
+                    lambda chunk=chunk, block_id=block_id: client.post(
+                        upload_url,
+                        params={"chunk": block_id},
+                        headers={
+                            "Authorization": credential,
+                            "Content-Length": str(len(chunk)),
+                            "Content-Type": "application/octet-stream",
+                        },
+                        content=chunk,
+                    ),
+                    f"upload remote chunk {block_id}",
+                )
+                response.raise_for_status()
+                self._raise_cloudreve_error_if_present(response)
+                block_id += 1
+
+    def _upload_to_onedrive(self, path: Path, session: dict) -> None:
+        upload_urls = session.get("upload_urls") or session.get("uploadURLs") or []
+        upload_url = upload_urls[0]
+        chunk_size = int(
+            self._session_value(
+                session,
+                "chunk_size",
+                "chunkSize",
+                default=4 * 1024 * 1024,
+            )
+        )
+        file_size = path.stat().st_size
+        with httpx.Client(timeout=60) as client, path.open("rb") as file_obj:
+            for start in range(0, file_size, chunk_size):
+                chunk = file_obj.read(chunk_size)
+                end = start + len(chunk) - 1
+                response = self._send_with_retries(
+                    lambda chunk=chunk, start=start, end=end: client.put(
+                        upload_url,
+                        headers={
+                            "Content-Range": f"bytes {start}-{end}/{file_size}",
+                            "Content-Type": "application/octet-stream",
+                        },
+                        content=chunk,
+                    ),
+                    f"upload OneDrive chunk starting at {start}",
+                )
+                response.raise_for_status()
+        callback_secret = session.get("callback_secret") or session.get("callbackSecret")
+        if callback_secret:
+            session_id = self._session_value(session, "session_id", "sessionID")
+            self._request("POST", f"/callback/onedrive/{session_id}/{callback_secret}")
+
+    def _create_link(self, storage_key: str, *, expire: str | None = None) -> str | None:
+        if self.config.get("prefer_direct_url"):
+            data = self._request(
+                "PUT",
+                "/file/source",
+                json={"uris": [self._cloudreve_uri(storage_key)]},
+            )
+            if isinstance(data, list) and data:
+                return data[0].get("link") or data[0].get("url")
+            return None
+        data = self._request(
+            "PUT",
+            "/share",
+            json={
+                "uri": self._cloudreve_uri(storage_key),
+                "downloads": None,
+                "expire": duration_seconds(expire) if expire else None,
+                "password": None,
+                "is_private": False,
+                "share_view": None,
+                "show_readme": None,
+            },
+        )
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            return data.get("url") or data.get("link") or data.get("share_url")
         return None
 
-    def _remote_path(self, path: Path) -> str:
-        root_path = (self.config.get("root_path") or "/").rstrip("/")
-        return f"{root_path}/{path.name}" if root_path else f"/{path.name}"
+    def _download_url(self, storage_key: str) -> str:
+        data = self._request(
+            "POST",
+            "/file/url",
+            json={"download": True, "uris": [self._cloudreve_uri(storage_key)]},
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError("Cloudreve download URL response was not an object.")
+        urls = data.get("urls") or []
+        if not urls:
+            raise RuntimeError("Cloudreve did not return a download URL.")
+        url = urls[0].get("url")
+        if not url:
+            raise RuntimeError("Cloudreve download URL response is missing url.")
+        return self._absolute_url(url)
+
+    def _request(self, method: str, path: str, **kwargs) -> dict | list | str | None:
+        self._ensure_token()
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.update(self._auth_headers())
+        with httpx.Client(base_url=self.base_url, timeout=60) as client:
+            response = self._send_with_retries(
+                lambda: client.request(method, path, headers=headers, **kwargs),
+                f"{method} {path}",
+            )
+        response.raise_for_status()
+        return self._payload_data(response)
+
+    def _ensure_token(self) -> None:
+        if self._access_token:
+            return
+        with httpx.Client(base_url=self.base_url, timeout=60) as client:
+            response = self._send_with_retries(
+                lambda: client.post(
+                    "/session/token",
+                    json={
+                        "email": self.config["username"],
+                        "password": self.config["password"],
+                    },
+                ),
+                "login",
+            )
+        response.raise_for_status()
+        data = self._payload_data(response)
+        if not isinstance(data, dict):
+            raise RuntimeError("Cloudreve login response did not include token data.")
+        token = data.get("token") or {}
+        self._access_token = token.get("access_token") or data.get("access_token")
+        self._refresh_token = token.get("refresh_token") or data.get("refresh_token")
+        if not self._access_token:
+            raise RuntimeError("Cloudreve login response did not include an access token.")
+
+    def _auth_headers(self) -> dict[str, str]:
+        if not self._access_token:
+            return {}
+        return {"Authorization": f"Bearer {self._access_token}"}
+
+    def _remote_file_uri(self, path: Path) -> str:
+        root_path = (self.config.get("root_path") or "/").strip("/")
+        plain_path = f"/{root_path}/{path.name}" if root_path else f"/{path.name}"
+        return self._cloudreve_uri(plain_path)
+
+    def _cloudreve_uri(self, uri: str) -> str:
+        if uri.startswith("cloudreve://"):
+            normalized = uri
+        else:
+            normalized = uri if uri.startswith("/") else f"/{uri}"
+            normalized = f"cloudreve://my{normalized}"
+        while normalized.endswith("//"):
+            normalized = normalized[:-1]
+        return normalized
+
+    def _api_base_url(self, base_url: str) -> str:
+        normalized = base_url.rstrip("/")
+        if not normalized.endswith("/api/v4"):
+            normalized = f"{normalized}/api/v4"
+        return normalized
+
+    def _payload_data(self, response: httpx.Response) -> dict | list | str | None:
+        if not response.content:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        if isinstance(payload, dict) and payload.get("code") not in (None, 0):
+            message = payload.get("msg") or payload.get("message") or "Cloudreve API error"
+            raise RuntimeError(str(message))
+        if isinstance(payload, dict) and "data" in payload:
+            return payload["data"]
+        return payload
+
+    def _raise_cloudreve_error_if_present(self, response: httpx.Response) -> None:
+        content_type = response.headers.get("content-type", "")
+        if "json" not in content_type:
+            return
+        self._payload_data(response)
+
+    def _session_value(self, session: dict, *names: str, default=None):
+        for name in names:
+            if name in session:
+                return session[name]
+        if default is not None:
+            return default
+        raise RuntimeError(f"Cloudreve upload session is missing {names[0]}.")
+
+    def _absolute_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.netloc:
+            return url
+        if url.startswith("/"):
+            return urljoin(f"{self.site_url}/", url.lstrip("/"))
+        return urljoin(f"{self.base_url}/", url)
+
+    def _send_with_retries(
+        self,
+        send: Callable[[], httpx.Response],
+        operation: str,
+    ) -> httpx.Response:
+        attempts = int(self.config.get("network_retries", 3))
+        backoff = float(self.config.get("network_retry_backoff", 0.75))
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return send()
+            except _NETWORK_EXCEPTIONS as exc:
+                last_error = exc
+                if attempt == attempts:
+                    break
+                sleep(backoff * attempt)
+        raise RuntimeError(
+            f"Cloudreve network error during {operation}: {last_error}. "
+            f"Retried {attempts} time(s)."
+        ) from last_error
