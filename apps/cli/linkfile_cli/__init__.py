@@ -1,0 +1,1 @@
+"""LinkFile CLI package."""
