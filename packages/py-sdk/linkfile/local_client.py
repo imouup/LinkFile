@@ -10,7 +10,7 @@ class LocalLinkFileClient:
         self.config_file = config_file or get_default_paths().config_file
 
     @classmethod
-    def from_config(cls) -> "LocalLinkFileClient":
+    def from_config(cls) -> LocalLinkFileClient:
         return cls()
 
     def upload_file(self, path: str | Path, *, expire: str | None = None) -> None:

@@ -1,5 +1,5 @@
 [project]
-name = "linkfile"
+name = "linkfile-sdk"
 version = "0.1.0"
 description = "Python SDK for LinkFile online and local clients."
 readme = "README.md"

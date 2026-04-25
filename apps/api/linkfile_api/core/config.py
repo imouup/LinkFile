@@ -20,7 +20,10 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:4321"],
         alias="LINKFILE_CORS_ORIGINS",
     )
-    server_master_key: str = Field(default="change-me-32-bytes-key", alias="LINKFILE_SERVER_MASTER_KEY")
+    server_master_key: str = Field(
+        default="change-me-32-bytes-key",
+        alias="LINKFILE_SERVER_MASTER_KEY",
+    )
     default_storage_encryption_mode: str = Field(
         default="server_managed",
         alias="LINKFILE_DEFAULT_STORAGE_ENCRYPTION_MODE",

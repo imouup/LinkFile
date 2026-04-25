@@ -1,7 +1,7 @@
 [project]
-name = "linkfile-monorepo"
+name = "linkfile"
 version = "0.1.0"
-description = "LinkFile monorepo: offline-first BYOS file sharing CLI, API, web app, and Python SDK."
+description = "LinkFile: offline-first BYOS file sharing CLI, API, web app, and Python SDK."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
