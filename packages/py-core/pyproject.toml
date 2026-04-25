@@ -1,6 +1,6 @@
 [project]
 name = "linkfile-core"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared LinkFile core primitives for config, storage backends, crypto, local index, and local-server."
 readme = "README.md"
 requires-python = ">=3.11"

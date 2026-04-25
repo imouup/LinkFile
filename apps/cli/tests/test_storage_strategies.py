@@ -222,13 +222,102 @@ def test_cloudreve_download_url_normalization() -> None:
         }
     )
 
-    assert strategy._absolute_url("https://cdn.example.com/file") == "https://cdn.example.com/file"
-    assert strategy._absolute_url("/api/v4/file/download/x") == (
+    assert (
+        strategy._absolute_url("https://cdn.example.com/file", strategy.base_url_v4)
+        == "https://cdn.example.com/file"
+    )
+    assert strategy._absolute_url("/api/v4/file/download/x", strategy.base_url_v4) == (
         "https://cloud.example.com/api/v4/file/download/x"
     )
-    assert strategy._absolute_url("file/download/x") == (
+    assert strategy._absolute_url("file/download/x", strategy.base_url_v4) == (
         "https://cloud.example.com/api/v4/file/download/x"
     )
+
+
+def test_cloudreve_v3_upload_uses_file_id(monkeypatch) -> None:
+    work_dir = Path.cwd() / "test-runtime" / uuid4().hex
+    work_dir.mkdir(parents=True)
+    source = work_dir / "report.txt"
+    source.write_text("hello", encoding="utf-8")
+    calls: list[tuple[str, str]] = []
+
+    def response(method: str, path: str, payload: dict | list | str | None) -> httpx.Response:
+        request_url = path
+        if path.startswith("/"):
+            request_url = f"https://cloud.example.com/api/v3{path}"
+        if payload is None:
+            return httpx.Response(204, request=httpx.Request(method, request_url))
+        return httpx.Response(
+            200,
+            json={"code": 0, "msg": "ok", "data": payload},
+            request=httpx.Request(method, request_url),
+        )
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def post(self, path, **kwargs):
+            calls.append(("POST", path))
+            if path == "/user/session":
+                return response("POST", path, {"user": "ok"})
+            return self.request("POST", path, **kwargs)
+
+        def request(self, method, path, **kwargs):
+            calls.append((method, path))
+            if method == "GET" and path.startswith("/directory"):
+                return response(
+                    "GET",
+                    path,
+                    {
+                        "policy": {"id": "policy", "type": "local"},
+                        "objects": [{"id": "file123", "name": "report.txt"}],
+                    },
+                )
+            if method == "PUT" and path == "/file/upload":
+                return response(
+                    "PUT",
+                    path,
+                    {"sessionID": "session", "chunkSize": 1024},
+                )
+            if method == "POST" and path == "/file/upload/session/0":
+                return response("POST", path, None)
+            if method == "POST" and path == "/file/source":
+                return response("POST", path, [{"url": "https://cloud.example.com/d/report"}])
+            return httpx.Response(404, request=httpx.Request(method, path))
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    strategy = CloudreveStrategy(
+        {
+            "id": "my-cloud",
+            "type": "cloudreve",
+            "base_url": "https://cloud.example.com",
+            "username": "user",
+            "password": "pass",
+            "root_path": "/LinkFile",
+            "prefer_direct_url": True,
+            "api_version": "v3",
+        }
+    )
+
+    try:
+        result = strategy.upload_file(source)
+
+        assert result.storage_key == "file123"
+        assert result.raw_url == "https://cloud.example.com/d/report"
+        assert ("POST", "/user/session") in calls
+        assert ("PUT", "/file/upload") in calls
+        assert ("POST", "/file/upload/session/0") in calls
+    finally:
+        source.unlink(missing_ok=True)
+        work_dir.rmdir()
 
 
 def test_cloudreve_retries_transient_network_errors() -> None:

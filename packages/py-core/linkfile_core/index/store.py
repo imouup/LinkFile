@@ -57,9 +57,14 @@ class LocalIndex:
 
     def add_upload_result(self, result: UploadResult) -> FileRecord:
         self.initialize()
+        existing = self._find_by_storage(result.storage_method_id, result.storage_key)
         now = datetime.now(UTC).isoformat()
+        file_id = existing.file_id if existing else result.file_id
+        created_at = existing.created_at if existing else now
+        if existing:
+            result.file_id = file_id
         record = FileRecord(
-            file_id=result.file_id,
+            file_id=file_id,
             name=result.name,
             size=result.size,
             storage_method_id=result.storage_method_id,
@@ -69,7 +74,7 @@ class LocalIndex:
             public_url=result.public_url,
             share_url=result.share_url,
             expires_at=result.expires_at.isoformat() if result.expires_at else None,
-            created_at=now,
+            created_at=created_at,
             updated_at=now,
             metadata=result.metadata,
         )
@@ -135,6 +140,23 @@ class LocalIndex:
         self.initialize()
         with self._connect() as conn:
             conn.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
+
+    def _find_by_storage(self, storage_method_id: str, storage_key: str) -> FileRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT file_id, name, size, storage_method_id, storage_type, storage_key,
+                       mime_type, public_url, share_url, expires_at, created_at, updated_at,
+                       metadata_json
+                FROM files
+                WHERE storage_method_id = ? AND storage_key = ?
+                LIMIT 1
+                """,
+                (storage_method_id, storage_key),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_record(row)
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.index_file)

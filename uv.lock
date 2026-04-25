@@ -424,7 +424,7 @@ wheels = [
 
 [[package]]
 name = "linkfile"
-version = "0.1.0"
+version = "0.1.1"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -445,7 +445,7 @@ dev = [
 
 [[package]]
 name = "linkfile-api"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "apps/api" }
 dependencies = [
     { name = "fastapi" },
@@ -464,7 +464,7 @@ requires-dist = [
 
 [[package]]
 name = "linkfile-cli"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "apps/cli" }
 dependencies = [
     { name = "boto3" },
@@ -485,7 +485,7 @@ requires-dist = [
 
 [[package]]
 name = "linkfile-core"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "packages/py-core" }
 dependencies = [
     { name = "cryptography" },
@@ -502,7 +502,7 @@ requires-dist = [
 
 [[package]]
 name = "linkfile-sdk"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "packages/py-sdk" }
 dependencies = [
     { name = "httpx" },
