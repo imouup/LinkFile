@@ -24,7 +24,7 @@ jobs:
         uses: astral-sh/setup-uv@v3
 
       - name: Build CLI package
-        run: uv build --package apps/cli
+        run: uv build --package linkfile-cli
 
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
