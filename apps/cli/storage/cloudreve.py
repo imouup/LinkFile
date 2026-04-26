@@ -163,15 +163,7 @@ class CloudreveStrategy:
 
     def _v4_test_connection(self) -> None:
         root_path = self.config.get("root_path") or "/"
-        self._request_v4(
-            "GET",
-            "/file",
-            params={
-                "uri": self._cloudreve_uri(root_path),
-                "page": 0,
-                "page_size": 1,
-            },
-        )
+        self._v4_list_or_create_dir(root_path)
 
     def _v3_test_connection(self) -> None:
         root_path = self.config.get("root_path") or "/"
@@ -194,7 +186,7 @@ class CloudreveStrategy:
         remote_path = self._v3_remote_path(path)
         dir_path = remote_path.rsplit("/", 1)[0] or "/"
         name = remote_path.rsplit("/", 1)[1]
-        listing = self._v3_list(dir_path)
+        listing = self._v3_list_or_create_dir(dir_path)
         policy = listing.get("policy") or {}
         policy_id = policy.get("id")
         policy_type = policy.get("type")
@@ -219,17 +211,7 @@ class CloudreveStrategy:
 
     def _v4_create_upload_session(self, path: Path, storage_key: str) -> dict:
         parent_uri = storage_key.rsplit("/", 1)[0] or "/"
-        directory = self._request_v4(
-            "GET",
-            "/file",
-            params={
-                "uri": self._cloudreve_uri(parent_uri),
-                "page": 0,
-                "page_size": 1,
-                "order_by": "name",
-                "order": "asc",
-            },
-        )
+        directory = self._v4_list_or_create_dir(parent_uri)
         policy = directory.get("storage_policy") or {}
         policy_id = policy.get("id")
         if policy_id is None:
@@ -641,8 +623,79 @@ class CloudreveStrategy:
             raise RuntimeError("Cloudreve V3 directory response was not an object.")
         return data
 
+    def _v3_list_or_create_dir(self, path: str) -> dict:
+        try:
+            return self._v3_list(path)
+        except RuntimeError as exc:
+            if not self._is_missing_path_error(exc):
+                raise
+        self._v3_ensure_dir(path)
+        return self._v3_list(path)
+
+    def _v3_ensure_dir(self, path: str) -> None:
+        normalized = self._v3_plain_path(path)
+        if normalized == "/":
+            return
+        try:
+            self._v3_list(normalized)
+            return
+        except RuntimeError as exc:
+            if not self._is_missing_path_error(exc):
+                raise
+        parent = normalized[: normalized.rfind("/")] or "/"
+        self._v3_ensure_dir(parent)
+        try:
+            self._v3_create_dir(normalized)
+        except RuntimeError as exc:
+            if not self._is_conflict_error(exc):
+                raise
+
     def _v3_create_dir(self, path: str) -> None:
         self._request_v3("PUT", "/directory", json={"path": self._v3_plain_path(path)})
+
+    def _v4_list_dir(self, uri: str) -> dict:
+        data = self._request_v4(
+            "GET",
+            "/file",
+            params={
+                "uri": self._cloudreve_uri(uri),
+                "page": 0,
+                "page_size": 1,
+                "order_by": "name",
+                "order": "asc",
+            },
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError("Cloudreve directory response was not an object.")
+        return data
+
+    def _v4_list_or_create_dir(self, uri: str) -> dict:
+        try:
+            return self._v4_list_dir(uri)
+        except RuntimeError as exc:
+            if self._v4_is_root_uri(uri) or not self._is_missing_path_error(exc):
+                raise
+        self._v4_create_dir(uri)
+        return self._v4_list_dir(uri)
+
+    def _v4_create_dir(self, uri: str) -> None:
+        try:
+            self._request_v4(
+                "POST",
+                "/file/create",
+                json={
+                    "type": "folder",
+                    "uri": self._cloudreve_uri(uri),
+                    "err_on_conflict": False,
+                    "error_on_conflict": False,
+                },
+            )
+        except RuntimeError as exc:
+            if not self._is_conflict_error(exc):
+                raise
+
+    def _v4_is_root_uri(self, uri: str) -> bool:
+        return self._cloudreve_uri(uri).rstrip("/") == "cloudreve://my"
 
     def _v3_get_id(self, file_path: str) -> str:
         file_path = self._v3_plain_path(file_path)
@@ -679,8 +732,9 @@ class CloudreveStrategy:
         except ValueError:
             return None
         if isinstance(payload, dict) and payload.get("code") not in (None, 0):
+            code = payload.get("code")
             message = payload.get("msg") or payload.get("message") or "Cloudreve API error"
-            raise RuntimeError(str(message))
+            raise RuntimeError(f"{message} (code {code})")
         if isinstance(payload, dict) and "data" in payload:
             return payload["data"]
         return payload
@@ -714,6 +768,16 @@ class CloudreveStrategy:
             or "40016" in message
             or "file not found" in message
             or "not found" in message
+            or "parent directory does not exist" in message
+        )
+
+    def _is_conflict_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "40004" in message
+            or "already exists" in message
+            or "object already exists" in message
+            or "resource conflict" in message
         )
 
     def _extract_link(self, value: object) -> str | None:
