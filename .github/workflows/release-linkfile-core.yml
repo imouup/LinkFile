@@ -1,4 +1,4 @@
-name: Build UV packages on release
+name: Build and publish linkfile-core
 
 on:
   release:
@@ -10,7 +10,7 @@ permissions:
   id-token: write
 
 jobs:
-  publish:
+  publish-core:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,11 +31,3 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/core
-
-      - name: Build CLI package
-        run: uv build --package linkfile-cli --out-dir dist/cli
-
-      - name: Publish CLI to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist/cli
