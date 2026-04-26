@@ -1,6 +1,6 @@
 # LinkFile
 
-Version: `0.1.1`
+Version: `0.1.2`
 
 LinkFile is a lightweight BYOS file sharing tool for AI workflows, temporary downloads, and personal direct links.
 
@@ -116,7 +116,7 @@ linkfile delete file_xxx --yes
 
 Creates the local config file and local SQLite index.
 
-The config stores storage methods and credentials locally. In `0.1.1`, credentials are stored in plain text in `config.json`.
+The config stores storage methods and credentials locally. In `0.1.2`, credentials are stored in plain text in `config.json`.
 
 ### `linkfile storage add s3`
 

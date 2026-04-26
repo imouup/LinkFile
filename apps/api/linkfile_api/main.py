@@ -8,7 +8,7 @@ from linkfile_api.core.config import get_settings
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="LinkFile API", version="0.1.1", debug=settings.debug)
+    app = FastAPI(title="LinkFile API", version="0.1.2", debug=settings.debug)
     app.include_router(api_router)
     return app
 

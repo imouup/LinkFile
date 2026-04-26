@@ -1,6 +1,6 @@
 # LinkFile
 
-版本：`0.1.1`
+版本：`0.1.2`
 
 LinkFile 是一个轻量的 BYOS 文件分享工具，面向 AI 工作流、临时下载和个人直链发布。
 
@@ -109,7 +109,7 @@ linkfile delete file_xxx --yes
 
 创建本地配置文件和本地 SQLite 索引。
 
-配置文件会保存 storage method 和凭证。`0.1.1` 中，凭证会以明文保存在 `config.json`。
+配置文件会保存 storage method 和凭证。`0.1.2` 中，凭证会以明文保存在 `config.json`。
 
 ### `linkfile storage add s3`
 
